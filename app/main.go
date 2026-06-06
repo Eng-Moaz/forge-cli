@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
@@ -40,14 +39,11 @@ func main() {
 		modelName = "anthropic/claude-haiku-4.5"
 	}
 
-	client := openai.NewClient(option.WithAPIKey(apiKey), option.WithBaseURL(baseUrl))
-	resp, err := client.Chat.Completions.New(context.Background(),
-		openai.ChatCompletionNewParams{
-			Model: modelName,
-			Messages: []openai.ChatCompletionMessageParamUnion{
-				openai.UserMessage(prompt),
-			},
-			Tools: []openai.ChatCompletionToolUnionParam{
+	messages := []openai.ChatCompletionMessageParamUnion{
+		openai.UserMessage(prompt),
+	}
+	
+	tools := []openai.ChatCompletionToolUnionParam{
 				openai.ChatCompletionFunctionTool(openai.FunctionDefinitionParam{
 					Name: "Read",
 					Description: openai.String("Read and return the contents of a file"),
@@ -62,7 +58,32 @@ func main() {
 						"required": []string{"file_path"},
 					},
 				}),
-			},
+				openai.ChatCompletionFunctionTool(openai.FunctionDefinitionParam{
+					Name: "Write",
+					Description: openai.String("Write a content to a file"),
+					Parameters: openai.FunctionParameters{
+						"type": "object",
+						"properties": map[string]any{
+							"file_path": map[string]any{
+								"type": "string",
+								"description": "The path to the file to write to",
+							},
+							"content": map[string]any{
+								"type": "string",
+								"description": "The content to write to the file",
+							},
+						},
+						"required": []string{"file_path", "content"},
+					},
+				}),
+			}
+
+	client := openai.NewClient(option.WithAPIKey(apiKey), option.WithBaseURL(baseUrl))
+	resp, err := client.Chat.Completions.New(context.Background(),
+		openai.ChatCompletionNewParams{
+			Model: modelName,
+			Messages: messages,
+			Tools: tools,
 		},
 	)
 
@@ -76,43 +97,36 @@ func main() {
 
 	//fmt.Fprintln(os.Stderr)
 
-	message := resp.Choices[0].Message
-
-	if len(message.ToolCalls) == 0 {
-		fmt.Println(message.Content)
-	}else{
-		messages := []openai.ChatCompletionMessageParamUnion{
-			openai.UserMessage(prompt),
-			message.ToParam(),
-		}
-		for _, toolCall := range message.ToolCalls{
-			if toolCall.Function.Name == "Read"{
-				var args map[string]interface{}
-				if err := json.Unmarshal([]byte(toolCall.Function.Arguments), &args); err != nil{
-					fmt.Println("Error unmarshaling:", err)
-					os.Exit(1)
+	for {
+		message := resp.Choices[0].Message
+		if len(message.ToolCalls) == 0 {
+			fmt.Println(message.Content)
+			os.Exit(0)
+		}else{
+			messages = append(messages, message.ToParam())
+			for _, toolCall := range message.ToolCalls{
+				switch toolCall.Function.Name{
+				case "Read":			
+					fileContent := FileReader([]byte(toolCall.Function.Arguments))
+					messages = append(messages, openai.ToolMessage(fileContent, toolCall.ID))
+				case "Write":
+					FileWriter([]byte(toolCall.Function.Arguments))
 				}
-				filePath, ok := args["file_path"].(string)
-				if !ok{
-					panic("LLM did not provide a valid file_path string")
-				}
-				fileContent := Read(filePath)
-
-				messages = append(messages, openai.ToolMessage(fileContent, toolCall.ID))
 			}
+
+			finalResp, err := client.Chat.Completions.New(context.Background(),
+				openai.ChatCompletionNewParams{
+					Model:    modelName,
+					Messages: messages,
+					Tools: tools,
+				},
+			)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "error on second pass: %v\n", err)
+				os.Exit(1)
+			}
+			resp = finalResp
 		}
-
-		finalResp, err := client.Chat.Completions.New(context.Background(),
-            openai.ChatCompletionNewParams{
-                Model:    modelName,
-                Messages: messages,
-            },
-        )
-        if err != nil {
-            fmt.Fprintf(os.Stderr, "error on second pass: %v\n", err)
-            os.Exit(1)
-        }
-
-        fmt.Print(finalResp.Choices[0].Message.Content)
 	}
+	
 }
